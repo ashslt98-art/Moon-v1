@@ -1,17 +1,17 @@
 'use strict';
 
-// Moon-vision async adapter v1.0
+// Moon-vision async adapter v1.1
 // Entry point: index.handler
-// Keep the current v2.8.4.12 implementation unchanged as moon-vision-core.js.
-// Normal HTTPS calls are passed straight through to the core.
-// Async HTTPS calls (?integration=async) are delivered as a raw body; this
-// adapter converts that body into the HTTP event expected by the existing core.
+// Keep moon-vision-core.js as the source of truth for existing routes.
+// This adapter preserves all existing HTTP behavior and adds an optional,
+// additive answer_ready field to the existing poll response for the Android UI.
 
+const crypto = require('crypto');
 const core = require('./moon-vision-core.js');
 
 const MAX_ASYNC_WORK_MS = 110000;
 const POLL_INTERVAL_MS = 900;
-const VERSION = 'mv-async-adapter-1.0';
+const VERSION = 'mv-async-adapter-1.1';
 
 function rawToText(value) {
   if (Buffer.isBuffer(value)) return value.toString('utf8');
@@ -116,11 +116,62 @@ async function runCore(event, context) {
   return { result, data };
 }
 
+// Preserve the existing poll and marker contract. The added notification is
+// deliberately only a short-lived text-change signal; the skill remains the
+// authoritative owner of the full answer and its qid/cid/uid validation.
+async function runHttp(event, context) {
+  const initial = await core.handler(event, context);
+  const qp = (event && event.queryStringParameters) || {};
+  const method = String(event && event.httpMethod || 'GET').toUpperCase();
+
+  if (method !== 'GET' || qp.poll !== '1' || initial.statusCode >= 400) {
+    return initial;
+  }
+
+  const pollBody = parseCoreBody(initial);
+  if (!pollBody || pollBody.status !== 'ok') return initial;
+
+  const stateEvent = {
+    httpMethod: 'GET',
+    headers: event.headers || {},
+    queryStringParameters: {
+      token: String(qp.token || ''),
+      state: '1'
+    }
+  };
+  const stateResult = await core.handler(stateEvent, context);
+  const state = parseCoreBody(stateResult);
+  const text = state && typeof state.text === 'string'
+    ? state.text.replace(/\s+/g, ' ').trim().slice(0, 160)
+    : '';
+
+  if (!text) return initial;
+
+  const answerReady = {
+    type: 'answer_ready',
+    text: text,
+    key: crypto.createHash('sha256').update(text).digest('hex').slice(0, 20)
+  };
+
+  return Object.assign({}, initial, {
+    body: JSON.stringify(Object.assign({}, pollBody, {
+      answer_ready: answerReady
+    }))
+  });
+}
+
 module.exports.handler = async function (event, context) {
-  // Keep every existing synchronous endpoint operational.
+  // Existing HTTPS routes remain synchronous and are passed through.
   if (event && typeof event === 'object' &&
       typeof event.httpMethod === 'string') {
-    return core.handler(event, context);
+    try {
+      return await runHttp(event, context);
+    } catch (e) {
+      console.error('moon-vision poll adapter: ' + (e && e.message));
+      // Do not turn an otherwise valid marker poll into an error just because
+      // the optional notification enrichment failed.
+      return core.handler(event, context);
+    }
   }
 
   const payload = readAsyncPayload(event);
@@ -147,9 +198,6 @@ module.exports.handler = async function (event, context) {
     return { status: data.status, qid: data.qid || null };
   }
 
-  // The core normally completes the work during the POST itself. If it reports
-  // query, poll the existing synchronous answer endpoint from this same async
-  // execution. Pending records can also be resumed by that endpoint.
   const qid = Number(data.qid);
   if (!Number.isSafeInteger(qid) || qid <= 0) {
     throw new Error('Moon-vision did not return a valid qid');
@@ -171,7 +219,5 @@ module.exports.handler = async function (event, context) {
     }
   }
 
-  // Throw so the platform can apply the configured asynchronous retry policy.
-  // The existing core's CID check prevents creation of a second logical query.
   throw new Error('Moon-vision async work did not finish within the execution budget');
 };
